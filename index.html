@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MIDI Lissajous Visualizer</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #ddd;
+    font-family: system-ui, sans-serif; overflow: hidden; height: 100%; }
+  #controls { position: fixed; top: 12px; left: 12px; z-index: 10;
+    background: rgba(0,0,0,0.55); padding: 10px 14px; border-radius: 10px;
+    backdrop-filter: blur(6px); border: 1px solid #222; }
+  #controls > * { margin: 3px 4px; }
+  button { background: #1a1a1a; color: #ddd; border: 1px solid #333;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #2a2a2a; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input[type=file] { color: #aaa; font-size: 12px; }
+  label { font-size: 12px; }
+  #info { font-size: 11px; opacity: 0.7; margin-top: 4px; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <div>
+    <input type="file" id="file" accept=".mid,.midi">
+    <button id="play" disabled>▶ Play</button>
+    <button id="stop" disabled>■ Stop</button>
+  </div>
+  <div>
+    <label>Trail <input type="range" id="trail" min="1" max="30" value="8"></label>
+    <label>Scale <input type="range" id="scale" min="50" max="600" value="220"></label>
+    <label>Vol <input type="range" id="vol" min="0" max="100" value="35"></label>
+  </div>
+  <div id="info">Load a .mid file to begin</div>
+</div>
+<canvas id="canvas"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/build/Midi.js"></script>
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  let W, H;
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const fileInput = document.getElementById('file');
+  const playBtn = document.getElementById('play');
+  const stopBtn = document.getElementById('stop');
+  const trailEl = document.getElementById('trail');
+  const scaleEl = document.getElementById('scale');
+  const volEl = document.getElementById('vol');
+  const info = document.getElementById('info');
+
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = audioCtx.createGain();
+  master.gain.value = 0.35;
+  master.connect(audioCtx.destination);
+  volEl.addEventListener('input', () => {
+    master.gain.setTargetAtTime(volEl.value / 100, audioCtx.currentTime, 0.02);
+  });
+
+  const ATTACK = 0.012;
+  const RELEASE = 0.09;
+
+  let midi = null;
+  let scheduled = [];     // {osc, gain, freq, velocity, noteStart, noteOff, projAngle}
+  let isPlaying = false;
+  let startTime = 0;
+  let totalDuration = 0;
+
+  // Map a MIDI note to an angle in 2D using the circle of fifths for visual harmony.
+  // Each note becomes a unit direction; sum of all active sines forms the curve.
+  function projectionAngle(midiNote) {
+    const pc = ((midiNote % 12) + 12) % 12;
+    const fifths = (pc * 7) % 12;            // circle of fifths position
+    // small octave offset so different octaves don't perfectly overlap
+    const octave = Math.floor(midiNote / 12);
+    return (fifths / 12) * Math.PI * 2 + octave * 0.07;
+  }
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const buffer = await file.arrayBuffer();
+      midi = new Midi(buffer);
+      const noteCount = midi.tracks.reduce((s, t) => s + t.notes.length, 0);
+      totalDuration = midi.duration;
+      info.textContent = `${file.name} • ${noteCount} notes • ${totalDuration.toFixed(1)}s`;
+      playBtn.disabled = false;
+    } catch (err) {
+      info.textContent = 'Failed to parse MIDI: ' + err.message;
+    }
+  });
+
+  function clearScheduled() {
+    for (const s of scheduled) {
+      try { s.osc.stop(); } catch (e) {}
+      try { s.osc.disconnect(); s.gain.disconnect(); } catch (e) {}
+    }
+    scheduled = [];
+  }
+
+  function play() {
+    if (!midi || isPlaying) return;
+    audioCtx.resume();
+    clearScheduled();
+    startTime = audioCtx.currentTime + 0.15;
+
+    for (const track of midi.tracks) {
+      for (const note of track.notes) {
+        const freq = 440 * Math.pow(2, (note.midi - 69) / 12);
+        const osc = audioCtx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0;
+
+        const tStart = startTime + note.time;
+        const tOff = tStart + note.duration;
+        const v = note.velocity;
+
+        gain.gain.setValueAtTime(0, tStart);
+        gain.gain.linearRampToValueAtTime(v, tStart + ATTACK);
+        gain.gain.setValueAtTime(v, Math.max(tOff, tStart + ATTACK + 0.001));
+        gain.gain.linearRampToValueAtTime(0, tOff + RELEASE);
+
+        osc.connect(gain);
+        gain.connect(master);
+        osc.start(tStart);
+        osc.stop(tOff + RELEASE + 0.02);
+
+        scheduled.push({
+          osc, gain, freq,
+          velocity: v,
+          noteStart: tStart,
+          noteOff: tOff,
+          noteEnd: tOff + RELEASE,
+          projAngle: projectionAngle(note.midi),
+          midi: note.midi,
+        });
+      }
+    }
+    isPlaying = true;
+    playBtn.disabled = true;
+    stopBtn.disabled = false;
+
+    const endsAt = startTime + totalDuration + RELEASE + 0.5;
+    const checker = setInterval(() => {
+      if (!isPlaying) { clearInterval(checker); return; }
+      if (audioCtx.currentTime > endsAt) {
+        stop(); clearInterval(checker);
+      }
+    }, 200);
+  }
+
+  function stop() {
+    clearScheduled();
+    isPlaying = false;
+    playBtn.disabled = !midi;
+    stopBtn.disabled = true;
+  }
+
+  playBtn.addEventListener('click', play);
+  stopBtn.addEventListener('click', stop);
+
+  // Compute envelope amplitude analytically (mirrors the audio gain shape)
+  function envAmp(s, t) {
+    const dt = t - s.noteStart;
+    const dur = s.noteOff - s.noteStart;
+    if (dt < 0) return 0;
+    if (dt < ATTACK) return s.velocity * (dt / ATTACK);
+    if (dt < dur) return s.velocity;
+    if (dt < dur + RELEASE) return s.velocity * (1 - (dt - dur) / RELEASE);
+    return 0;
+  }
+
+  // Visualization: each active note contributes A_i * sin(2π f_i t) along
+  // a unique 2D direction (cos θ_i, sin θ_i). The traced parametric curve is
+  // a higher-dimensional Lissajous projected onto the plane.
+  function draw() {
+    requestAnimationFrame(draw);
+
+    // Motion-blur fade
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillRect(0, 0, W, H);
+
+    if (!isPlaying) return;
+
+    const now = audioCtx.currentTime;
+    const active = [];
+    let totalAmp = 0;
+    for (const s of scheduled) {
+      if (now >= s.noteStart - 0.01 && now <= s.noteEnd + 0.01) {
+        const a = envAmp(s, now);
+        if (a > 0.001) {
+          active.push({ freq: s.freq, amp: a, ang: s.projAngle, midi: s.midi });
+          totalAmp += a;
+        }
+      }
+    }
+    if (active.length === 0) return;
+
+    // Normalize so the curve stays visible regardless of polyphony
+    const norm = 1 / Math.max(1, Math.sqrt(totalAmp));
+
+    const scale = parseFloat(scaleEl.value);
+    const trailMs = parseFloat(trailEl.value) * 6;     // ms of curve to trace
+    const windowSec = trailMs / 1000;
+    const samples = Math.min(3000, 400 + Math.floor(windowSec * 40000));
+
+    // Color by average pitch class
+    let pcSum = 0;
+    for (const a of active) pcSum += a.midi;
+    const avgMidi = pcSum / active.length;
+    const hue = (avgMidi * 12) % 360;
+
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = `hsla(${hue}, 90%, 65%, 0.85)`;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = `hsla(${hue}, 90%, 60%, 0.6)`;
+
+    ctx.beginPath();
+    const cx = W / 2, cy = H / 2;
+    for (let i = 0; i < samples; i++) {
+      const t = now + (i / samples) * windowSec;
+      let x = 0, y = 0;
+      for (const a of active) {
+        const v = Math.sin(2 * Math.PI * a.freq * t) * a.amp;
+        x += Math.cos(a.ang) * v;
+        y += Math.sin(a.ang) * v;
+      }
+      const px = cx + x * scale * norm;
+      const py = cy + y * scale * norm;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  draw();
+})();
+</script>
+</body>
+</html>
